@@ -25,7 +25,7 @@ async fn main() {
             Ok(_) => {}
             Err(err) => println!("List entitlements: {err}"),
         },
-        Commands::Jita(jita::Commands::List) => match jita::list().await {
+        Commands::Jita(jita::Commands::List) => match jita::grants().await {
             Ok(_) => {}
             Err(err) => println!("List JITA grants: {err}"),
         },
@@ -41,6 +41,10 @@ pub mod jita {
     use clap::Subcommand;
     use google_cloud_gax::paginator::ItemPaginator;
     use google_cloud_privilegedaccessmanager_v1::client::PrivilegedAccessManager;
+    use google_cloud_privilegedaccessmanager_v1::model::{
+        CreateGrantRequest, Entitlement, Grant, Justification,
+    };
+    use std::time::Duration;
 
     #[derive(Debug, Clone, Subcommand)]
     pub enum Commands {
@@ -60,16 +64,24 @@ pub mod jita {
         Request(#[from] google_cloud_privilegedaccessmanager_v1::Error),
     }
 
-    pub async fn entitlements() -> Result<(), Error> {
-        println!("=== List of Nada entitlements ===");
+    async fn list_entitlements() -> Result<Vec<Entitlement>, Error> {
         let client = PrivilegedAccessManager::builder().build().await?;
+        let mut result = vec![];
         let mut item_iterator = client
             .list_entitlements()
             .set_parent(GLOBAL_FOLDER)
             .by_item();
         while let Some(item) = item_iterator.next().await {
-            let item = item?;
-            let Some(friendly_name) = item
+            result.push(item?);
+        }
+        Ok(result)
+    }
+
+    pub async fn entitlements() -> Result<(), Error> {
+        println!("=== List of Nada entitlements ===");
+        let entitlements = list_entitlements().await?;
+        for ent in entitlements {
+            let Some(friendly_name) = ent
                 .name
                 .strip_prefix(GLOBAL_FOLDER)
                 .and_then(|unfriendly_name| unfriendly_name.strip_prefix("/entitlements/"))
@@ -81,11 +93,44 @@ pub mod jita {
         Ok(())
     }
 
-    pub async fn list() -> Result<(), Error> {
+    pub async fn grants() -> Result<(), Error> {
+        let entitlements = list_entitlements().await?;
+        let client = PrivilegedAccessManager::builder().build().await?;
+        for ent in entitlements {
+            let mut item_iterator = client.list_grants().set_parent(&ent.name).by_item();
+            while let Some(item) = item_iterator.next().await {
+                let item = item?;
+                let Some(friendly_name) = item.name.strip_prefix(&ent.name)
+                //.and_then(|unfriendly_name| unfriendly_name.strip_prefix("/entitlements/"))
+                else {
+                    continue;
+                };
+                println!("- {friendly_name}");
+            }
+        }
         Ok(())
     }
 
     pub async fn grant() -> Result<(), Error> {
+        let entitlements = list_entitlements().await?;
+        create_grant(entitlements.first().unwrap()).await
+    }
+
+    pub async fn create_grant(entitlement: &Entitlement) -> Result<(), Error> {
+        let client = PrivilegedAccessManager::builder().build().await?;
+        let hour = google_cloud_wkt::Duration::new(3600, 0).unwrap();
+        let justification = Justification::new().set_unstructured_justification("dette er en test");
+        let grant = Grant::new()
+            .set_requested_duration(hour)
+            .set_justification(justification);
+        let req = CreateGrantRequest::new().set_grant(grant);
+        let grant = client
+            .create_grant()
+            .with_request(req)
+            .set_parent(entitlement.name.clone())
+            .send()
+            .await?;
+        println!("Grant: {grant:?}");
         Ok(())
     }
 }

@@ -929,6 +929,7 @@ dependencies = [
  "clap",
  "google-cloud-gax",
  "google-cloud-privilegedaccessmanager-v1",
+ "google-cloud-wkt",
  "thiserror",
  "tokio",
 ]
