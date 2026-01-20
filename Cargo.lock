@@ -927,7 +927,9 @@ name = "nada-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "google-cloud-gax",
  "google-cloud-privilegedaccessmanager-v1",
+ "thiserror",
  "tokio",
 ]
 
