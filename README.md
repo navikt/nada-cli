@@ -9,6 +9,13 @@ Run `nada --help` to show all possible sub-commands and their syntax.
 
 For sub-command help, you may use `nada <SUBCOMMAND> --help`.
 
+The command-line interface relies heavily on `gcloud`. Before using the Nada CLI, please authenticate using `gcloud` and
+make sure to update your _application default credentials_. i.e.,
+
+```shell
+gcloud auth login --update-adc --force
+```
+
 ## Installing
 
 ### Prerequisites
