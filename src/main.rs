@@ -1,4 +1,5 @@
 mod jita;
+mod kubeconfig;
 
 use clap::{Parser, Subcommand};
 
@@ -14,21 +15,43 @@ enum Commands {
     /// Gain just-in-time access for Google Cloud privileged resources.
     #[command(subcommand)]
     Jita(jita::Commands),
+    /// Work with Kubernetes configuration.
+    #[command(subcommand)]
+    Kubeconfig(kubeconfig::Commands),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("{0}")]
+    Jita(#[from] jita::Error),
+    #[error("{0}")]
+    Kubeconfig(#[from] kubeconfig::Error),
+}
+
+async fn run_subcommand(command: Commands) -> Result<(), Error> {
+    match command {
+        Commands::Jita(subcommand) => match subcommand {
+            jita::Commands::Entitlements => jita::entitlements().await?,
+            jita::Commands::List => jita::grants().await?,
+            jita::Commands::Grant {
+                entitlement,
+                duration,
+                reason,
+            } => {
+                jita::grant_using_dialog(entitlement, duration.map(|d| d.as_secs()), reason).await?
+            }
+        },
+        Commands::Kubeconfig(subcommand) => match subcommand {
+            kubeconfig::Commands::Update => kubeconfig::update_config_file().await?,
+        },
+    };
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let command_result = match cli.command {
-        Commands::Jita(jita::Commands::Entitlements) => jita::entitlements().await,
-        Commands::Jita(jita::Commands::List) => jita::grants().await,
-        Commands::Jita(jita::Commands::Grant {
-            entitlement,
-            duration,
-            reason,
-        }) => jita::grant_using_dialog(entitlement, duration.map(|d| d.as_secs()), reason).await,
-    };
-    let Err(err) = command_result else {
+    let Err(err) = run_subcommand(cli.command).await else {
         return;
     };
     println!("Command failed: {err}");
