@@ -37,15 +37,20 @@ pub mod jita {
     /// Nada's global GCP folder.
     const GLOBAL_FOLDER: &'static str = "folders/739335424622/locations/global";
 
+    use chrono::{DateTime, Timelike, Utc};
     use clap::Subcommand;
     use google_cloud_gax::paginator::ItemPaginator;
     use google_cloud_privilegedaccessmanager_v1::client::PrivilegedAccessManager;
+    use google_cloud_privilegedaccessmanager_v1::model::justification::Justification::UnstructuredJustification;
     use google_cloud_privilegedaccessmanager_v1::model::{
         CreateGrantRequest, Entitlement, Grant, Justification,
     };
+    use google_cloud_wkt::Timestamp;
+    use std::cmp::Ordering;
     use std::io::Write;
     use std::str::FromStr;
     use std::time::Duration;
+    use tabwriter::TabWriter;
 
     #[derive(Debug, Clone, Subcommand)]
     pub enum Commands {
@@ -82,36 +87,45 @@ pub mod jita {
     }
 
     pub async fn entitlements() -> Result<(), Error> {
-        println!("=== List of Nada entitlements ===");
-        let entitlements = fetch_entitlement_list().await?;
-        for ent in entitlements {
-            let Some(friendly_name) = ent
-                .name
-                .strip_prefix(GLOBAL_FOLDER)
-                .and_then(|unfriendly_name| unfriendly_name.strip_prefix("/entitlements/"))
-            else {
-                continue;
-            };
-            println!("- {friendly_name}");
+        for entitlement in fetch_entitlement_list().await? {
+            println!("{}", entitlement.name);
         }
         Ok(())
     }
 
     pub async fn grants() -> Result<(), Error> {
-        let entitlements = fetch_entitlement_list().await?;
-        let client = PrivilegedAccessManager::builder().build().await?;
-        for ent in entitlements {
-            let mut item_iterator = client.list_grants().set_parent(&ent.name).by_item();
-            while let Some(item) = item_iterator.next().await {
-                let item = item?;
-                let Some(friendly_name) = item.name.strip_prefix(&ent.name)
-                //.and_then(|unfriendly_name| unfriendly_name.strip_prefix("/entitlements/"))
-                else {
-                    continue;
-                };
-                println!("- {friendly_name}");
-            }
+        let mut output = TabWriter::new(std::io::stdout());
+        let _ = write!(&mut output, "ID\tSTATE\tTIME\tDURATION_SECS\tREASON\n");
+        for grant in fetch_grant_list().await? {
+            let grant_id = grant
+                .name
+                .split("/")
+                .last()
+                .map(|grant_id| grant_id.to_string())
+                .unwrap_or_default();
+            let justification = grant.justification.and_then(|just| just.justification);
+            let justification_text = match justification {
+                Some(UnstructuredJustification(x)) => x,
+                _ => "".to_string(),
+            };
+            let time_text = grant
+                .create_time
+                .and_then(timestamp_to_date)
+                .and_then(|x| x.with_nanosecond(0))
+                .map(|x| x.naive_local())
+                .map(|x| x.to_string())
+                .unwrap_or("???".to_string());
+            let _ = write!(
+                &mut output,
+                "{}\t{}\t{}\t{}\t{}\n",
+                grant_id,
+                grant.state,
+                time_text,
+                grant.requested_duration.unwrap_or_default().seconds(),
+                justification_text,
+            );
         }
+        let _ = output.flush();
         Ok(())
     }
 
@@ -272,6 +286,23 @@ pub mod jita {
         }
     }
 
+    async fn fetch_grant_list() -> Result<Vec<Grant>, Error> {
+        let mut result = vec![];
+        let client = PrivilegedAccessManager::builder().build().await?;
+        for entitlement in fetch_entitlement_list().await? {
+            let mut item_iterator = client.list_grants().set_parent(&entitlement.name).by_item();
+            while let Some(item) = item_iterator.next().await {
+                result.push(item?);
+            }
+        }
+        result.sort_by(|a, b| {
+            b.create_time
+                .partial_cmp(&a.create_time)
+                .unwrap_or(Ordering::Greater)
+        });
+        Ok(result)
+    }
+
     async fn create_grant(
         entitlement_id: impl ToString,
         duration: google_cloud_wkt::Duration,
@@ -289,5 +320,9 @@ pub mod jita {
             .set_parent(entitlement_id.to_string())
             .send()
             .await?)
+    }
+
+    fn timestamp_to_date(ts: Timestamp) -> Option<DateTime<Utc>> {
+        DateTime::from_timestamp(ts.seconds(), ts.nanos() as u32)
     }
 }
