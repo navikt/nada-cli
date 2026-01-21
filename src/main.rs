@@ -150,6 +150,9 @@ pub mod jita {
             std::io::stdout().flush().unwrap();
             match read_bool_stdin() {
                 Some(true) => {
+                    println!();
+                    println!("Requesting privilege escalation...");
+                    println!();
                     let grant = create_grant(&entitlement_id, duration, &reason).await?;
                     println!();
                     println!("Success! Your privileges have been escalated!");
