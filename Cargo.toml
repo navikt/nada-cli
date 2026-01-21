@@ -13,3 +13,6 @@ humantime = "2.3.0"
 tabwriter = "1.4.1"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
+
+[[bin]]
+name = "nada"
