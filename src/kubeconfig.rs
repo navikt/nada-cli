@@ -1,13 +1,36 @@
 use clap::Subcommand;
+use google_cloud_container_v1::model::ListClustersRequest;
+use google_cloud_gax::error::rpc::Code;
+use google_cloud_gax::paginator::ItemPaginator;
+use google_cloud_resourcemanager_v3::model::{ListProjectsRequest, Project};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
     /// Update $KUBECONFIG with Nada clusters.
-    Update,
+    Update {
+        /// Override Google Cloud folders used to look for Kubernetes clusters.
+        #[arg(short, long, default_values_t = default_folders())]
+        folders: Vec<String>,
+        /// Override Google Cloud locations where Kubernetes clusters should be running.
+        #[arg(short, long, default_values_t = default_locations())]
+        locations: Vec<String>,
+    },
+}
+
+fn default_folders() -> Vec<String> {
+    vec!["739335424622".into(), "105918521196".into()]
+}
+
+fn default_locations() -> Vec<String> {
+    vec!["europe-north1".into(), "europe-west1".into()]
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("initialize client: {0}")]
+    Builder(#[from] google_cloud_gax::client_builder::Error),
+    #[error("PAM: {0}")]
+    Pam(#[from] google_cloud_privilegedaccessmanager_v1::Error),
     #[error("OS error: {0}")]
     OS(#[from] std::io::Error),
     #[error("gcloud subprocess aborted")]
@@ -22,19 +45,73 @@ struct ClusterReference {
     location: String,
 }
 
-macro_rules! cluster {
-    ($name: literal, $goog: literal, $loc: literal) => {
-        ClusterReference {
-            name: $name.to_string(),
-            google_project_name: $goog.to_string(),
-            location: $loc.to_string(),
+async fn fetch_clusters_in_projects(
+    projects: &Vec<Project>,
+    locations: &Vec<String>,
+) -> Result<Vec<ClusterReference>, Error> {
+    let client = google_cloud_container_v1::client::ClusterManager::builder()
+        .build()
+        .await?;
+    let mut result = vec![];
+    for project in projects {
+        for location in locations {
+            let parent_id = format!("{}/locations/{}", project.name, location);
+            let request = ListClustersRequest::new().set_parent(parent_id);
+            let resp = match client.list_clusters().with_request(request).send().await {
+                Ok(resp) => resp,
+                Err(err)
+                    if err
+                        .status()
+                        .is_some_and(|err| err.code == Code::PermissionDenied) =>
+                {
+                    // Silently ignore "permission denied".
+                    // this error code is being used to report that the GKE API is not enabled for that project.
+                    // We really don't care because we are traversing a whole bunch of projects.
+                    //println!("{:?}: {}", err.status(), err);
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            for cluster in resp.clusters {
+                result.push(ClusterReference {
+                    name: cluster.name,
+                    google_project_name: project.project_id.clone(),
+                    location: cluster.location,
+                });
+            }
         }
-    };
+    }
+    Ok(result)
 }
 
-pub async fn update_config_file() -> Result<(), Error> {
-    for cluster in builtin_clusters() {
-        println!("Downloading credentials for cluster '{}' in Google project '{}'...", cluster.name, cluster.google_project_name);
+async fn fetch_project_list(folders: Vec<String>) -> Result<Vec<Project>, Error> {
+    let client = google_cloud_resourcemanager_v3::client::Projects::builder()
+        .build()
+        .await?;
+    let mut result = vec![];
+    for folder in folders {
+        let folder_id = format!("folders/{}", folder);
+        let request = ListProjectsRequest::new().set_parent(folder_id);
+        let mut item_iterator = client.list_projects().with_request(request).by_item();
+        while let Some(item) = item_iterator.next().await {
+            result.push(item?);
+        }
+    }
+    Ok(result)
+}
+
+pub async fn update_config_file(folders: Vec<String>, locations: Vec<String>) -> Result<(), Error> {
+    println!("Enumerating projects in {} folders...", folders.len());
+    let projects = fetch_project_list(folders).await?;
+
+    println!("Enumerating clusters in {} projects...", projects.len());
+    let clusters = fetch_clusters_in_projects(&projects, &locations).await?;
+
+    for cluster in clusters {
+        println!(
+            "Downloading credentials for cluster '{}' in Google project '{}'...",
+            cluster.name, cluster.google_project_name
+        );
 
         let status = std::process::Command::new("gcloud")
             .arg("container")
@@ -57,12 +134,4 @@ pub async fn update_config_file() -> Result<(), Error> {
     println!("All clusters configured successfully!");
 
     Ok(())
-}
-
-fn builtin_clusters() -> Vec<ClusterReference> {
-    vec![
-        cluster!("knada-gke", "knada-gcp", "europe-north1"),
-        cluster!("knada-gke-dev", "knada-dev", "europe-north1"),
-        cluster!("knada-gpu", "knada-dev", "europe-west1"),
-    ]
 }

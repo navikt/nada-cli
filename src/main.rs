@@ -42,7 +42,9 @@ async fn run_subcommand(command: Commands) -> Result<(), Error> {
             }
         },
         Commands::Kubeconfig(subcommand) => match subcommand {
-            kubeconfig::Commands::Update => kubeconfig::update_config_file().await?,
+            kubeconfig::Commands::Update { folders, locations } => {
+                kubeconfig::update_config_file(folders, locations).await?
+            }
         },
     };
     Ok(())
