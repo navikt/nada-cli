@@ -34,9 +34,9 @@ pub enum Error {
     Pam(#[from] google_cloud_privilegedaccessmanager_v1::Error),
     #[error("OS error: {0}")]
     OS(#[from] std::io::Error),
-    #[error("gcloud subprocess aborted")]
+    #[error("Subprocess aborted")]
     Killed,
-    #[error("gcloud returned non-zero exit code: {0}")]
+    #[error("Subprocess returned non-zero exit code: {0}")]
     ExitCode(i32),
 }
 
@@ -147,25 +147,66 @@ pub async fn update_config_file(folders: Vec<String>, locations: Vec<String>) ->
             cluster.name, cluster.google_project_name
         );
 
-        let status = std::process::Command::new("gcloud")
-            .arg("container")
-            .arg("clusters")
-            .arg("get-credentials")
-            .arg(cluster.name)
-            .arg("--project")
-            .arg(cluster.google_project_name)
-            .arg("--location")
-            .arg(cluster.location)
-            .status()?
-            .code()
-            .ok_or(Error::Killed)?;
+        println!("{:?}", cluster);
 
-        if status != 0 {
-            return Err(Error::ExitCode(status));
-        }
+        gcloud_download_cluster_credentials(&cluster)?;
+        kubectx_rename_cluster(&cluster)?;
     }
 
     println!("All clusters configured successfully!");
 
     Ok(())
+}
+
+fn gcloud_download_cluster_credentials(cluster: &ClusterReference) -> Result<(), Error> {
+    match std::process::Command::new("gcloud")
+        .arg("container")
+        .arg("clusters")
+        .arg("get-credentials")
+        .arg(&cluster.name)
+        .arg("--project")
+        .arg(&cluster.google_project_name)
+        .arg("--location")
+        .arg(&cluster.location)
+        .status()?
+        .code()
+        .ok_or(Error::Killed)?
+    {
+        0 => Ok(()),
+        exit_code => Err(Error::ExitCode(exit_code)),
+    }
+}
+
+fn kubectx_rename_cluster(cluster: &ClusterReference) -> Result<(), Error> {
+    let autogen_name = gcloud_get_autogen_name(cluster);
+    let friendly_name = &cluster.name;
+    let rename_invocation = format!("{friendly_name}={autogen_name}");
+    match std::process::Command::new("kubectx")
+        .arg(rename_invocation)
+        .status()?
+        .code()
+        .ok_or(Error::Killed)?
+    {
+        0 => Ok(()),
+        exit_code => Err(Error::ExitCode(exit_code)),
+    }
+}
+
+fn gcloud_get_autogen_name(cluster: &ClusterReference) -> String {
+    let project = &cluster.google_project_name;
+    let region = &cluster.location;
+    let cluster_name = &cluster.name;
+    format!("gke_{project}_{region}_{cluster_name}")
+}
+
+#[cfg(test)]
+#[test]
+fn test_autogen() {
+    let cluster = ClusterReference {
+        name: "knada-gke".to_string(),
+        google_project_name: "knada-gcp".to_string(),
+        location: "europe-north1".to_string(),
+    };
+    let autogen_name = gcloud_get_autogen_name(&cluster);
+    assert_eq!("gke_knada-gcp_europe-north1_knada-gke", autogen_name);
 }
