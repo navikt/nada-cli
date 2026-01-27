@@ -2,7 +2,9 @@ use clap::Subcommand;
 use google_cloud_container_v1::model::ListClustersRequest;
 use google_cloud_gax::error::rpc::Code;
 use google_cloud_gax::paginator::ItemPaginator;
-use google_cloud_resourcemanager_v3::model::{ListProjectsRequest, Project};
+use google_cloud_resourcemanager_v3::model::{
+    ListFoldersRequest, ListProjectsRequest, Project
+};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -84,14 +86,30 @@ async fn fetch_clusters_in_projects(
     Ok(result)
 }
 
+async fn fetch_subfolder_ids_recursive(folder_id: impl ToString) -> Result<Vec<String>, Error> {
+    let client = google_cloud_resourcemanager_v3::client::Folders::builder()
+        .build()
+        .await?;
+    let request = ListFoldersRequest::new().set_parent(folder_id.to_string());
+    let mut item_iterator = client.list_folders().with_request(request).by_item();
+    let mut result = vec![];
+    result.push(folder_id.to_string());
+    while let Some(item) = item_iterator.next().await {
+        let folder_id = item?.name.to_string();
+        result.push(folder_id.clone());
+        let mut child_folders = Box::pin(fetch_subfolder_ids_recursive(folder_id)).await?;
+        result.append(&mut child_folders);
+    }
+    Ok(result)
+}
+
 async fn fetch_project_list(folders: Vec<String>) -> Result<Vec<Project>, Error> {
     let client = google_cloud_resourcemanager_v3::client::Projects::builder()
         .build()
         .await?;
     let mut result = vec![];
     for folder in folders {
-        let folder_id = format!("folders/{}", folder);
-        let request = ListProjectsRequest::new().set_parent(folder_id);
+        let request = ListProjectsRequest::new().set_parent(folder);
         let mut item_iterator = client.list_projects().with_request(request).by_item();
         while let Some(item) = item_iterator.next().await {
             result.push(item?);
@@ -101,11 +119,25 @@ async fn fetch_project_list(folders: Vec<String>) -> Result<Vec<Project>, Error>
 }
 
 pub async fn update_config_file(folders: Vec<String>, locations: Vec<String>) -> Result<(), Error> {
-    println!("Enumerating projects in {} folders...", folders.len());
-    let projects = fetch_project_list(folders).await?;
+    println!("Enumerating subfolders in {} folders...", folders.len());
+    let folder_ids: Vec<String> = folders
+        .into_iter()
+        .map(|folder_id| format!("folders/{folder_id}"))
+        .collect();
+    let mut result = vec![];
+    for folder_id in folder_ids {
+        let mut folders = fetch_subfolder_ids_recursive(folder_id).await?;
+        result.append(&mut folders);
+    }
+
+    println!("Enumerating projects in {} folders...", result.len());
+    let projects = fetch_project_list(result).await?;
 
     println!("Enumerating clusters in {} projects...", projects.len());
     let clusters = fetch_clusters_in_projects(&projects, &locations).await?;
+
+    println!("Found a total of {} clusters to configure.", clusters.len());
+    println!("-----");
 
     for cluster in clusters {
         println!(
