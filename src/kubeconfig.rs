@@ -2,9 +2,8 @@ use clap::Subcommand;
 use google_cloud_container_v1::model::ListClustersRequest;
 use google_cloud_gax::error::rpc::Code;
 use google_cloud_gax::paginator::ItemPaginator;
-use google_cloud_resourcemanager_v3::model::{
-    ListFoldersRequest, ListProjectsRequest, Project
-};
+use google_cloud_resourcemanager_v3::model::{ListFoldersRequest, ListProjectsRequest, Project};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -41,6 +40,7 @@ pub enum Error {
     ExitCode(i32),
 }
 
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct ClusterReference {
     name: String,
     google_project_name: String,
@@ -50,11 +50,11 @@ struct ClusterReference {
 async fn fetch_clusters_in_projects(
     projects: &Vec<Project>,
     locations: &Vec<String>,
-) -> Result<Vec<ClusterReference>, Error> {
+) -> Result<HashSet<ClusterReference>, Error> {
     let client = google_cloud_container_v1::client::ClusterManager::builder()
         .build()
         .await?;
-    let mut result = vec![];
+    let mut result = HashSet::new();
     for project in projects {
         for location in locations {
             let parent_id = format!("{}/locations/{}", project.name, location);
@@ -75,7 +75,7 @@ async fn fetch_clusters_in_projects(
                 Err(err) => return Err(err.into()),
             };
             for cluster in resp.clusters {
-                result.push(ClusterReference {
+                result.insert(ClusterReference {
                     name: cluster.name,
                     google_project_name: project.project_id.clone(),
                     location: cluster.location,
@@ -86,24 +86,26 @@ async fn fetch_clusters_in_projects(
     Ok(result)
 }
 
-async fn fetch_subfolder_ids_recursive(folder_id: impl ToString) -> Result<Vec<String>, Error> {
+async fn fetch_subfolder_ids_recursive(folder_id: impl ToString) -> Result<HashSet<String>, Error> {
     let client = google_cloud_resourcemanager_v3::client::Folders::builder()
         .build()
         .await?;
     let request = ListFoldersRequest::new().set_parent(folder_id.to_string());
     let mut item_iterator = client.list_folders().with_request(request).by_item();
-    let mut result = vec![];
-    result.push(folder_id.to_string());
+    let mut result = HashSet::new();
+    result.insert(folder_id.to_string());
     while let Some(item) = item_iterator.next().await {
         let folder_id = item?.name.to_string();
-        result.push(folder_id.clone());
-        let mut child_folders = Box::pin(fetch_subfolder_ids_recursive(folder_id)).await?;
-        result.append(&mut child_folders);
+        result.insert(folder_id.clone());
+        let child_folders = Box::pin(fetch_subfolder_ids_recursive(folder_id)).await?;
+        result.extend(child_folders);
     }
     Ok(result)
 }
 
-async fn fetch_project_list(folders: Vec<String>) -> Result<Vec<Project>, Error> {
+async fn fetch_project_list(
+    folders: impl IntoIterator<Item = String>,
+) -> Result<Vec<Project>, Error> {
     let client = google_cloud_resourcemanager_v3::client::Projects::builder()
         .build()
         .await?;
@@ -124,10 +126,10 @@ pub async fn update_config_file(folders: Vec<String>, locations: Vec<String>) ->
         .into_iter()
         .map(|folder_id| format!("folders/{folder_id}"))
         .collect();
-    let mut result = vec![];
+    let mut result = HashSet::new();
     for folder_id in folder_ids {
-        let mut folders = fetch_subfolder_ids_recursive(folder_id).await?;
-        result.append(&mut folders);
+        let folders = fetch_subfolder_ids_recursive(folder_id).await?;
+        result.extend(folders);
     }
 
     println!("Enumerating projects in {} folders...", result.len());
