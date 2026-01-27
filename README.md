@@ -20,7 +20,7 @@ gcloud auth login --update-adc --force
 
 ### Prerequisites
 
-You must install `kubectl`, `gcloud`, and `gke-gcloud-auth-plugin`.
+You must install `kubectl`, `kubectx`, `gcloud`, and `gke-gcloud-auth-plugin`.
 
 Refer to the [Nais Command-line access documentation](https://doc.nais.io/operate/how-to/command-line-access) for setup
 instructions.
