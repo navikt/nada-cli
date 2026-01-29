@@ -27,7 +27,18 @@ instructions.
 
 Installing `kubelogin` is not required for the Nada command-line interface.
 
-### Installation steps
+### MacOS/Linux 
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/navikt/nada-cli/releases/download/v0.1.0/nada-cli-installer.sh | sh
+```
+
+### Windows
+```
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/navikt/nada-cli/releases/download/v0.1.0/nada-cli-installer.ps1 | iex"
+```
+
+### Manual Installation steps
 
 First, install Rustup, the Rust toolchain manager. Then, install the Rust toolchains for your architecture:
 
@@ -46,3 +57,12 @@ cargo install --path .
 
 Any binaries install with Cargo will be placed in `~/.cargo/bin`. Make sure your `$PATH` environment variable includes
 Cargo's bin directory.
+
+## Releasing
+
+Create a new release by bumping the version, committing the changes, and tagging the commit:
+
+```sh
+scripts/release.sh patch
+```
+The script updates Cargo.toml and `README.md` with the new version number, creates a git commit and tag, and pushes them to main after confirmation.

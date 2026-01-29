@@ -2,6 +2,7 @@
 name = "nada-cli"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/navikt/nada-cli"
 
 [dependencies]
 chrono = "0.4.43"
@@ -19,3 +20,8 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
 [[bin]]
 name = "nada"
 path = "./src/main.rs"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
