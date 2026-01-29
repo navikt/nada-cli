@@ -30,12 +30,12 @@ Installing `kubelogin` is not required for the Nada command-line interface.
 ### MacOS/Linux 
 
 ```
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/navikt/nada-cli/releases/download/v0.1.0/nada-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/navikt/nada-cli/releases/download/v0.1.1/nada-cli-installer.sh | sh
 ```
 
 ### Windows
 ```
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/navikt/nada-cli/releases/download/v0.1.0/nada-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/navikt/nada-cli/releases/download/v0.1.1/nada-cli-installer.ps1 | iex"
 ```
 
 ### Manual Installation steps
