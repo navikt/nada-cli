@@ -19,7 +19,10 @@ pub enum Commands {
 }
 
 fn default_folders() -> Vec<String> {
-    vec!["739335424622".into(), "105918521196".into()]
+    vec![
+        "78291733247".into(),  // dev
+        "105918521196".into(), // prod
+    ]
 }
 
 fn default_locations() -> Vec<String> {
