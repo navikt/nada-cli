@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use google_cloud_container_v1::model::ListClustersRequest;
+use google_cloud_container_v1::model::{Fleet, ListClustersRequest};
 use google_cloud_gax::error::rpc::Code;
 use google_cloud_gax::paginator::ItemPaginator;
 use google_cloud_resourcemanager_v3::model::{ListFoldersRequest, ListProjectsRequest, Project};
@@ -15,6 +15,9 @@ pub enum Commands {
         /// Override Google Cloud locations where Kubernetes clusters should be running.
         #[arg(short, long, default_values_t = default_locations())]
         locations: Vec<String>,
+        /// Use fleet Connect Gateway instead of direct GKE cluster credentials.
+        #[arg(long)]
+        gateway: bool,
     },
 }
 
@@ -49,9 +52,42 @@ struct ClusterReference {
     name: String,
     google_project_name: String,
     location: String,
+    membership: Option<FleetMembership>,
 }
 
-pub async fn update_config_file(folders: Vec<String>, locations: Vec<String>) -> Result<(), Error> {
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct FleetMembership {
+    project: String,
+    location: String,
+    name: String,
+}
+
+impl FleetMembership {
+    fn from_fleet(fleet: &Fleet) -> Option<Self> {
+        let path = fleet
+            .membership
+            .strip_prefix("//gkehub.googleapis.com/projects/")?;
+        let segments = path.split('/').collect::<Vec<_>>();
+        let [project, "locations", location, "memberships", name] = segments.as_slice() else {
+            return None;
+        };
+        if project.is_empty() || fleet.project.is_empty() || location.is_empty() || name.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            project: fleet.project.clone(),
+            location: (*location).into(),
+            name: (*name).into(),
+        })
+    }
+}
+
+pub async fn update_config_file(
+    folders: Vec<String>,
+    locations: Vec<String>,
+    gateway: bool,
+) -> Result<(), Error> {
     println!("Enumerating subfolders in {} folders...", folders.len());
     let folder_ids: Vec<String> = folders
         .into_iter()
@@ -73,6 +109,20 @@ pub async fn update_config_file(folders: Vec<String>, locations: Vec<String>) ->
     println!("-----");
 
     for cluster in clusters {
+        let membership = if gateway {
+            match cluster.membership.as_ref() {
+                Some(membership) => Some(membership),
+                None => {
+                    eprintln!(
+                        "Skipping cluster '{}' in Google project '{}': no usable fleet membership.",
+                        cluster.name, cluster.google_project_name
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         println!(
             "Downloading credentials for cluster '{}' in Google project '{}'...",
             cluster.name, cluster.google_project_name
@@ -80,8 +130,8 @@ pub async fn update_config_file(folders: Vec<String>, locations: Vec<String>) ->
 
         println!("{:?}", cluster);
 
-        gcloud_download_cluster_credentials(&cluster)?;
-        kubectx_rename_cluster(&cluster)?;
+        gcloud_download_cluster_credentials(&cluster, membership)?;
+        kubectx_rename_cluster(&cluster, membership)?;
     }
 
     println!("All clusters configured successfully!");
@@ -121,6 +171,7 @@ async fn fetch_clusters_in_projects(
                     name: cluster.name,
                     google_project_name: project.project_id.clone(),
                     location: cluster.location,
+                    membership: cluster.fleet.as_ref().and_then(FleetMembership::from_fleet),
                 });
             }
         }
@@ -163,28 +214,41 @@ async fn fetch_project_list(
 }
 
 /// Download cluster credentials and insert a cluster context using the `gcloud` command.
-fn gcloud_download_cluster_credentials(cluster: &ClusterReference) -> Result<(), Error> {
-    match std::process::Command::new("gcloud")
-        .arg("container")
-        .arg("clusters")
-        .arg("get-credentials")
-        .arg(&cluster.name)
-        .arg("--project")
-        .arg(&cluster.google_project_name)
-        .arg("--location")
-        .arg(&cluster.location)
-        .status()?
-        .code()
-        .ok_or(Error::Killed)?
-    {
+fn gcloud_download_cluster_credentials(
+    cluster: &ClusterReference,
+    membership: Option<&FleetMembership>,
+) -> Result<(), Error> {
+    let mut command = std::process::Command::new("gcloud");
+    command.arg("container");
+    if let Some(membership) = membership {
+        command
+            .args(["fleet", "memberships", "get-credentials"])
+            .arg(&membership.name)
+            .arg("--project")
+            .arg(&membership.project)
+            .arg("--location")
+            .arg(&membership.location);
+    } else {
+        command
+            .args(["clusters", "get-credentials"])
+            .arg(&cluster.name)
+            .arg("--project")
+            .arg(&cluster.google_project_name)
+            .arg("--location")
+            .arg(&cluster.location);
+    }
+    match command.status()?.code().ok_or(Error::Killed)? {
         0 => Ok(()),
         exit_code => Err(Error::ExitCode(exit_code)),
     }
 }
 
-/// Rename a GKE cluster context, retaining only the cluster name, stripping away the auto-generated `gke_...` parts.
-fn kubectx_rename_cluster(cluster: &ClusterReference) -> Result<(), Error> {
-    let autogen_name = gcloud_get_autogen_name(cluster);
+/// Rename a cluster context to its short cluster name.
+fn kubectx_rename_cluster(
+    cluster: &ClusterReference,
+    membership: Option<&FleetMembership>,
+) -> Result<(), Error> {
+    let autogen_name = gcloud_get_autogen_name(cluster, membership);
     let friendly_name = &cluster.name;
     let rename_invocation = format!("{friendly_name}={autogen_name}");
     match std::process::Command::new("kubectx")
@@ -199,7 +263,16 @@ fn kubectx_rename_cluster(cluster: &ClusterReference) -> Result<(), Error> {
 }
 
 /// Returns the cluster context name that is auto-generated by `gcloud`.
-fn gcloud_get_autogen_name(cluster: &ClusterReference) -> String {
+fn gcloud_get_autogen_name(
+    cluster: &ClusterReference,
+    membership: Option<&FleetMembership>,
+) -> String {
+    if let Some(membership) = membership {
+        return format!(
+            "connectgateway_{}_{}_{}",
+            membership.project, membership.location, membership.name
+        );
+    }
     let project = &cluster.google_project_name;
     let region = &cluster.location;
     let cluster_name = &cluster.name;
@@ -213,7 +286,44 @@ fn test_autogen() {
         name: "knada-gke".to_string(),
         google_project_name: "knada-gcp".to_string(),
         location: "europe-north1".to_string(),
+        membership: None,
     };
-    let autogen_name = gcloud_get_autogen_name(&cluster);
+    let autogen_name = gcloud_get_autogen_name(&cluster, None);
     assert_eq!("gke_knada-gcp_europe-north1_knada-gke", autogen_name);
+}
+
+#[cfg(test)]
+#[test]
+fn test_gateway_membership_and_context() {
+    let fleet = Fleet::new().set_project("nav-data-sandbox").set_membership(
+        "//gkehub.googleapis.com/projects/nav-data-sandbox/locations/global/memberships/sandbox",
+    );
+    let membership = FleetMembership::from_fleet(&fleet).unwrap();
+    let cluster = ClusterReference {
+        name: "sandbox".into(),
+        google_project_name: "cluster-project".into(),
+        location: "europe-north1".into(),
+        membership: None,
+    };
+    assert_eq!("nav-data-sandbox", membership.project);
+    assert_eq!("global", membership.location);
+    assert_eq!("sandbox", membership.name);
+    assert_eq!(
+        "connectgateway_nav-data-sandbox_global_sandbox",
+        gcloud_get_autogen_name(&cluster, Some(&membership))
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn test_missing_membership() {
+    assert!(FleetMembership::from_fleet(&Fleet::new().set_project("fleet-project")).is_none());
+    assert!(
+        FleetMembership::from_fleet(
+            &Fleet::new()
+                .set_project("fleet-project")
+                .set_membership("projects/fleet-project/locations/global/memberships/sandbox")
+        )
+        .is_none()
+    );
 }

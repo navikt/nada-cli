@@ -9,6 +9,10 @@ Run `nada --help` to show all possible sub-commands and their syntax.
 
 For sub-command help, you may use `nada <SUBCOMMAND> --help`.
 
+`nada kubeconfig update` uses direct GKE credentials by default. Use `nada kubeconfig update --gateway` to
+configure clusters through fleet Connect Gateway instead. Gateway mode uses each cluster's registered fleet
+membership and skips clusters without one.
+
 The command-line interface relies heavily on `gcloud`. Before using the Nada CLI, please authenticate using `gcloud` and
 make sure to update your _application default credentials_. i.e.,
 
