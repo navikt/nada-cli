@@ -1,3 +1,4 @@
+mod ingest;
 mod jita;
 mod kubeconfig;
 
@@ -18,6 +19,9 @@ enum Commands {
     /// Work with Kubernetes configuration.
     #[command(subcommand)]
     Kubeconfig(kubeconfig::Commands),
+    /// Configure Nais Postgres instances for ingestion.
+    #[command(subcommand)]
+    Ingest(ingest::Commands),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +30,8 @@ enum Error {
     Jita(#[from] jita::Error),
     #[error("{0}")]
     Kubeconfig(#[from] kubeconfig::Error),
+    #[error("{0}")]
+    Ingest(#[from] ingest::Error),
 }
 
 async fn run_subcommand(command: Commands) -> Result<(), Error> {
@@ -47,6 +53,11 @@ async fn run_subcommand(command: Commands) -> Result<(), Error> {
                 locations,
                 gateway,
             } => kubeconfig::update_config_file(folders, locations, gateway).await?,
+        },
+        Commands::Ingest(subcommand) => match subcommand {
+            ingest::Commands::Enable { database } => {
+                ingest::connect_and_enable_ingest(&database).await?
+            }
         },
     };
     Ok(())
