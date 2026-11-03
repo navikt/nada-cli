@@ -1,7 +1,12 @@
 use clap::Subcommand;
-use std::io::{BufRead, BufReader, Lines};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use sqlx::{ConnectOptions, Connection, PgConnection};
 use std::process::Stdio;
+use std::str::FromStr;
 use std::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
+use tokio::process::Command;
+use tokio::time::timeout;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -17,27 +22,35 @@ pub enum Commands {
 pub enum Error {
     #[error("unable to capture standard output")]
     Stdout,
+    #[error("Nais command-line interface timeout")]
+    Timeout,
+    #[error("Invalid port: {0}")]
+    InvalidPort(String),
+    #[error("Invalid SSL mode: {0}")]
+    InvalidSSLMode(String),
     #[error("OS error: {0}")]
     OS(#[from] std::io::Error),
+    #[error("Postgres error: {0}")]
+    Postgres(#[from] sqlx::Error),
 }
 
 /// A proxied connection to a Nais Postgres instance.
 ///
 /// The proxy is initialized by running `nais postgres proxy`.
 ///
-/// The Nais command-line interface will keep the connection open as long as the
-/// class instance is in scope, and the connection hasn't timed out.
-///
-/// Dropping the class instance will terminate the Nais proxy.
+/// The Nais command-line interface will keep the connection open indefinitely.
+/// To drop the proxied connection, callers *MUST* call `drop()` after finishing.
 struct PostgresProxy {
-    nais_cli_process: std::process::Child,
-    postgres_params: PostgresParams,
+    nais_cli_process: tokio::process::Child,
+    connection: PgConnection,
 }
 
 impl PostgresProxy {
     /// Use the Nais command-line interface to set up a connection proxy to a Nais Postgres instance.
+    ///
+    /// Note that
     pub async fn new(database: impl AsRef<str>) -> Result<Self, Error> {
-        let mut command = std::process::Command::new("nais");
+        let mut command = Command::new("nais");
         command.arg("postgres");
         command.arg("proxy");
         command.arg("--access-level").arg("admin");
@@ -57,97 +70,107 @@ impl PostgresProxy {
         // Parse Postgres connection parameters from environment variables
         // printed by Nais CLI.
         let stdout = nais_cli_process.stdout.take().ok_or(Error::Stdout)?;
-        let stdout_buffered = BufReader::new(stdout);
-        let lines = stdout_buffered.lines();
-        let postgres_params = PostgresParams::new_from_nais_env(lines);
+        let lines = BufReader::new(stdout).lines();
+        let postgres_params = Self::read_connect_options_from_stdout(lines).await.unwrap();
+
+        // Connect to the Postgres database.
+        let connection = postgres_params.connect().await?;
 
         Ok(Self {
-            postgres_params,
+            connection,
             nais_cli_process,
         })
     }
-}
 
-impl Drop for PostgresProxy {
-    fn drop(&mut self) {
-        // closing stdin should terminate the proxy
-        // let stdin = self.nais_cli_stdin.take();
-        // drop(stdin);
-
-        match self.nais_cli_process.wait() {
-            Ok(_) => {}
-            Err(err) => {
-                println!("Nais Postgres proxy: {err}")
+    /// Parse a single line of Nais CLI environment variable output and append it to the Postgres connect options.
+    ///
+    ///     PGHOST=value
+    ///     PGPORT=value
+    ///     ...
+    ///
+    /// Returns the accumulated Postgres connect options if the variable was accepted.
+    /// Otherwise, an error is returned.
+    ///
+    /// Unknown variables are ignored.
+    fn parse_stdout_env_into_connect_options(
+        mut opts: PgConnectOptions,
+        line: impl AsRef<str>,
+    ) -> Result<PgConnectOptions, Error> {
+        let mut parts = line.as_ref().splitn(2, "=");
+        let Some(key) = parts.next() else {
+            return Ok(opts);
+        };
+        let Some(value) = parts.next() else {
+            println!("Parse {key}=VALUE: no value");
+            return Ok(opts);
+        };
+        let value = value.trim_matches('\'');
+        println!("Captured {key}");
+        match key {
+            "PGHOST" => opts = opts.host(value), // fixme: use for hostname ssl validation
+            "PGHOSTADDR" => opts = opts.host(value),
+            "PGPORT" => {
+                let port = value
+                    .parse()
+                    .map_err(|_| Error::InvalidPort(value.to_string()))?;
+                opts = opts.port(port);
+            }
+            "PGUSER" => opts = opts.username(value),
+            "PGSSLMODE" => {
+                let ssl_mode = PgSslMode::from_str(value)
+                    .map_err(|_| Error::InvalidSSLMode(value.to_string()))?;
+                opts = opts.ssl_mode(ssl_mode);
+            }
+            "PGSSLROOTCERT" => opts = opts.ssl_root_cert(value),
+            "PGPASSWORD" => opts = opts.password(value),
+            "PGCONNECT_TIMEOUT" => {}
+            _ => {
+                println!("Ignoring environment variable {key} = {value}");
             }
         };
+        Ok(opts)
     }
-}
 
-#[derive(Default)]
-struct PostgresParams {
-    host: String,
-    host_address: String,
-    port: u16,
-    username: String,
-    password: String,
-    ssl_mode: String,
-    ssl_root_certificate_path: String,
-    connect_timeout: Duration,
-}
+    /// Parse all PG* environment variables from Nais CLI.
+    ///
+    /// This function times out after a few seconds, in that case an error is returned.
+    /// Otherwise, the Postgres connection options are returned.
+    ///
+    /// The first line from Nais CLI might take a while to appear,
+    /// so it has a longer timeout than subsequent lines.
+    async fn read_connect_options_from_stdout<B: AsyncBufRead + Unpin>(
+        mut lines: Lines<B>,
+    ) -> Result<PgConnectOptions, Error> {
+        let mut opts = PgConnectOptions::new();
 
-impl PostgresParams {
-    fn new_from_nais_env<B: BufRead>(lines: Lines<B>) -> Self {
-        let mut me = Self::default();
-        for line in lines {
-            let Ok(line) = line else {
-                break;
-            };
-            let mut parts = line.splitn(2, "=");
-            let Some(key) = parts.next() else {
-                continue;
-            };
-            let Some(value) = parts.next() else {
-                println!("Parse {key}=VALUE: no value");
-                continue;
-            };
-            let value = value.trim_matches('\'');
-            println!("{key} = {value}");
-            match key {
-                "PGHOST" => me.host = value.to_string(),
-                "PGHOSTADDR" => me.host_address = value.to_string(),
-                "PGPORT" => me.port = value.parse().unwrap(),
-                "PGUSER" => me.username = value.to_string(),
-                "PGSSLMODE" => me.ssl_mode = value.to_string(),
-                "PGSSLROOTCERT" => me.ssl_root_certificate_path = value.to_string(),
-                "PGCONNECT_TIMEOUT" => {
-                    me.connect_timeout = value.parse().map(Duration::from_secs).unwrap()
+        match timeout(Duration::from_secs(5), lines.next_line()).await {
+            Ok(Ok(Some(line))) => opts = Self::parse_stdout_env_into_connect_options(opts, line)?,
+            _ => return Err(Error::Timeout),
+        };
+
+        loop {
+            match timeout(Duration::from_millis(500), lines.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    opts = Self::parse_stdout_env_into_connect_options(opts, line)?
                 }
-                "PGPASSWORD" => me.password = value.to_string(),
-                _ => {
-                    println!("Ignoring unknown environment variable {key} = {value}");
-                }
-            };
-            if me.is_valid() {
-                break;
+                Ok(Ok(None)) => return Ok(opts),
+                Ok(Err(e)) => return Err(Error::OS(e)),
+                Err(_elapsed) => return Ok(opts),
             }
         }
-        me
     }
 
-    fn is_valid(&self) -> bool {
-        !(self.host.is_empty()
-            || self.host_address.is_empty()
-            || self.username.is_empty()
-            || self.password.is_empty()
-            || self.ssl_mode.is_empty()
-            || self.ssl_root_certificate_path.is_empty()
-            || self.port == 0
-            || self.connect_timeout.is_zero())
+    async fn close(mut self) -> Result<(), Error> {
+        self.connection.close().await?;
+        self.nais_cli_process.start_kill()?;
+        self.nais_cli_process.wait().await?;
+        Ok(())
     }
 }
 
 pub async fn connect_and_enable_ingest(database: impl AsRef<str>) -> Result<(), Error> {
     let connection = PostgresProxy::new(database).await?;
-    drop(connection);
+    println!("Connected to Nais Postgres");
+    connection.close().await?;
     Ok(())
 }
