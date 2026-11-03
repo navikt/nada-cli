@@ -1,13 +1,7 @@
+use crate::nais_postgres;
+use crate::nais_postgres::PostgresProxy;
 use clap::Subcommand;
-use sqlx::postgres::{PgConnectOptions, PgSslMode};
-use sqlx::{ConnectOptions, Connection, PgConnection};
-use std::process::Stdio;
-use std::str::FromStr;
-use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
-use tokio::process::Command;
-use tokio::time::timeout;
-use tracing::log::{debug, info};
+use tracing::log::info;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
@@ -21,18 +15,8 @@ pub enum Commands {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("unable to capture standard output")]
-    Stdout,
-    #[error("Nais command-line interface timeout")]
-    Timeout,
-    #[error("Invalid port: {0}")]
-    InvalidPort(String),
-    #[error("Invalid SSL mode: {0}")]
-    InvalidSSLMode(String),
-    #[error("OS error: {0}")]
-    OS(#[from] std::io::Error),
-    #[error("Postgres error: {0}")]
-    Postgres(#[from] sqlx::Error),
+    #[error("Nais Postgres proxy: {0}")]
+    Proxy(#[from] nais_postgres::Error),
 }
 
 /// Bootstrap a Nais Postgres database for use with Ingesterator.
@@ -41,158 +25,11 @@ pub enum Error {
 pub async fn connect_and_enable_ingest(database: impl AsRef<str>) -> Result<(), Error> {
     info!("Opening proxy connection to Nais Postgres...");
     let connection = PostgresProxy::new(database).await?;
+    
     info!("Connected to Nais Postgres!");
+    
     connection.close().await?;
     info!("Connection closed successfully.");
+    
     Ok(())
-}
-
-/// A proxied connection to a Nais Postgres instance.
-///
-/// The proxy is initialized by running `nais postgres proxy`.
-///
-/// The Nais command-line interface will keep the connection open indefinitely.
-/// To drop the proxied connection, callers *MUST* call `drop()` after finishing.
-struct PostgresProxy {
-    nais_cli_process: tokio::process::Child,
-    connection: PgConnection,
-}
-
-impl PostgresProxy {
-    /// How long to wait for Nais CLI to print the first line of configuration.
-    const NAIS_CLI_TIMEOUT_FIRST_OUTPUT: Duration = Duration::from_secs(5);
-
-    /// How long to wait for Nais CLI to print subsequent lines of configuration.
-    /// After this timeout is reached, the program considers Nais CLI ready to proxy connections.
-    const NAIS_CLI_TIMEOUT_SUBSEQUENT_OUTPUTS: Duration = Duration::from_millis(500);
-
-    /// Use the Nais command-line interface to set up a connection proxy to a Nais Postgres instance.
-    pub async fn new(database: impl AsRef<str>) -> Result<Self, Error> {
-        let mut command = Command::new("nais");
-
-        command
-            .arg("postgres")
-            .arg("proxy")
-            .arg("--print-password")
-            .arg("--access-level")
-            .arg("admin")
-            .arg("--output")
-            .arg("env")
-            .arg("--reason")
-            .arg("Configuring database for warehouse ingestion")
-            .arg(database.as_ref());
-
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::null());
-
-        let mut nais_cli_process = command.spawn()?;
-
-        let stdout = nais_cli_process.stdout.take().ok_or(Error::Stdout)?;
-        let lines = BufReader::new(stdout).lines();
-        let postgres_params = Self::read_connect_options_from_stdout(lines).await?;
-
-        let connection = postgres_params.connect().await?;
-
-        Ok(Self {
-            connection,
-            nais_cli_process,
-        })
-    }
-
-    /// Parse a single line of Nais CLI environment variable output and append it to the Postgres connect options.
-    ///
-    ///     PGHOST=value
-    ///     PGPORT=value
-    ///     ...
-    ///
-    /// Returns the accumulated Postgres connect options if the variable was accepted.
-    /// Otherwise, an error is returned.
-    ///
-    /// Unknown variables are ignored.
-    fn parse_stdout_env_into_connect_options(
-        mut opts: PgConnectOptions,
-        line: impl AsRef<str>,
-    ) -> Result<PgConnectOptions, Error> {
-        let mut parts = line.as_ref().splitn(2, "=");
-        let Some(key) = parts.next() else {
-            return Ok(opts);
-        };
-        let Some(value) = parts.next() else {
-            debug!("Parse {key}=VALUE: no value");
-            return Ok(opts);
-        };
-        let value = value.trim_matches('\'');
-        debug!("Captured environment variable {key} from Nais");
-        match key {
-            "PGHOST" => {}
-            "PGHOSTADDR" => opts = opts.host(value),
-            "PGPORT" => {
-                let port = value
-                    .parse()
-                    .map_err(|_| Error::InvalidPort(value.to_string()))?;
-                opts = opts.port(port);
-            }
-            "PGUSER" => opts = opts.username(value),
-            "PGSSLMODE" => {
-                let ssl_mode = PgSslMode::from_str(value)
-                    .map_err(|_| Error::InvalidSSLMode(value.to_string()))?;
-                opts = opts.ssl_mode(ssl_mode);
-            }
-            "PGSSLROOTCERT" => opts = opts.ssl_root_cert(value),
-            "PGPASSWORD" => opts = opts.password(value),
-            "PGCONNECT_TIMEOUT" => {}
-            _ => {
-                debug!("Ignoring environment variable {key} = {value}");
-            }
-        };
-
-        // Override SSL verification mode.
-        // Postgres libraries support both PGHOST and PGHOSTADDR in order to manually override
-        // the IP address while still verifying the SSL hostname. sqlx does not support this.
-        // Instead, set SSL verification mode to CA only, which is probably what we want.
-        opts = opts.ssl_mode(PgSslMode::VerifyCa);
-
-        // fixme: Override Postgres database; this should probably be set by Nais CLI.
-        opts = opts.database("app");
-
-        Ok(opts)
-    }
-
-    /// Parse all PG* environment variables from Nais CLI.
-    ///
-    /// This function times out after a few seconds, in that case an error is returned.
-    /// Otherwise, the Postgres connection options are returned.
-    ///
-    /// The first line from Nais CLI might take a while to appear,
-    /// so it has a longer timeout than subsequent lines.
-    async fn read_connect_options_from_stdout<B: AsyncBufRead + Unpin>(
-        mut lines: Lines<B>,
-    ) -> Result<PgConnectOptions, Error> {
-        let mut opts = PgConnectOptions::new();
-
-        match timeout(Self::NAIS_CLI_TIMEOUT_FIRST_OUTPUT, lines.next_line()).await {
-            Ok(Ok(Some(line))) => opts = Self::parse_stdout_env_into_connect_options(opts, line)?,
-            _ => return Err(Error::Timeout),
-        };
-
-        loop {
-            match timeout(Self::NAIS_CLI_TIMEOUT_SUBSEQUENT_OUTPUTS, lines.next_line()).await {
-                Ok(Ok(Some(line))) => {
-                    opts = Self::parse_stdout_env_into_connect_options(opts, line)?
-                }
-                Ok(Ok(None)) => return Ok(opts),
-                Ok(Err(e)) => return Err(Error::OS(e)),
-                Err(_elapsed) => return Ok(opts),
-            }
-        }
-    }
-
-    /// Close the Postgres connection, then kill the proxy and wait until the process is dead.
-    async fn close(mut self) -> Result<(), Error> {
-        self.connection.close().await?;
-        self.nais_cli_process.start_kill()?;
-        self.nais_cli_process.wait().await?;
-        Ok(())
-    }
 }

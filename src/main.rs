@@ -1,6 +1,7 @@
 mod ingest;
 mod jita;
 mod kubeconfig;
+mod nais_postgres;
 
 use clap::{Parser, Subcommand};
 
