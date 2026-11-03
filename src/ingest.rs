@@ -15,19 +15,75 @@ pub enum Commands {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("unable to set up standard input")]
-    Stdin,
     #[error("unable to capture standard output")]
     Stdout,
     #[error("OS error: {0}")]
     OS(#[from] std::io::Error),
-    #[error("Subprocess aborted")]
-    Killed,
-    #[error("Subprocess returned non-zero exit code: {0}")]
-    ExitCode(i32),
 }
 
-#[derive(Debug, Default)]
+/// A proxied connection to a Nais Postgres instance.
+///
+/// The proxy is initialized by running `nais postgres proxy`.
+///
+/// The Nais command-line interface will keep the connection open as long as the
+/// class instance is in scope, and the connection hasn't timed out.
+///
+/// Dropping the class instance will terminate the Nais proxy.
+struct PostgresProxy {
+    nais_cli_process: std::process::Child,
+    postgres_params: PostgresParams,
+}
+
+impl PostgresProxy {
+    /// Use the Nais command-line interface to set up a connection proxy to a Nais Postgres instance.
+    pub async fn new(database: impl AsRef<str>) -> Result<Self, Error> {
+        let mut command = std::process::Command::new("nais");
+        command.arg("postgres");
+        command.arg("proxy");
+        command.arg("--access-level").arg("admin");
+        command.arg("--output").arg("env");
+        command.arg("--print-password");
+        command
+            .arg("--reason")
+            .arg("Configuring database for warehouse ingestion");
+        command.arg(database.as_ref());
+
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::null());
+
+        let mut nais_cli_process = command.spawn()?;
+
+        // Parse Postgres connection parameters from environment variables
+        // printed by Nais CLI.
+        let stdout = nais_cli_process.stdout.take().ok_or(Error::Stdout)?;
+        let stdout_buffered = BufReader::new(stdout);
+        let lines = stdout_buffered.lines();
+        let postgres_params = PostgresParams::new_from_nais_env(lines);
+
+        Ok(Self {
+            postgres_params,
+            nais_cli_process,
+        })
+    }
+}
+
+impl Drop for PostgresProxy {
+    fn drop(&mut self) {
+        // closing stdin should terminate the proxy
+        // let stdin = self.nais_cli_stdin.take();
+        // drop(stdin);
+
+        match self.nais_cli_process.wait() {
+            Ok(_) => {}
+            Err(err) => {
+                println!("Nais Postgres proxy: {err}")
+            }
+        };
+    }
+}
+
+#[derive(Default)]
 struct PostgresParams {
     host: String,
     host_address: String,
@@ -91,37 +147,7 @@ impl PostgresParams {
 }
 
 pub async fn connect_and_enable_ingest(database: impl AsRef<str>) -> Result<(), Error> {
-    let mut command = std::process::Command::new("nais");
-    command.arg("postgres");
-    command.arg("proxy");
-    command.arg("--access-level").arg("admin");
-    command.arg("--output").arg("env");
-    command.arg("--print-password");
-    command
-        .arg("--reason")
-        .arg("Configuring database for warehouse ingestion");
-    command.arg(database.as_ref());
-
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::null());
-
-    let mut process = command.spawn()?;
-    let stdout = process.stdout.take().ok_or(Error::Stdout)?;
-    let stdin = process.stdin.take().ok_or(Error::Stdin)?;
-
-    let stdout = BufReader::new(stdout);
-    let lines = stdout.lines();
-
-    let params = PostgresParams::new_from_nais_env(lines);
-    println!("{params:?}");
-
-    // closing pipe should end the program
-    drop(stdin);
-
-    // fixme
-    //process.wait()?;
-    process.kill()?;
-
+    let connection = PostgresProxy::new(database).await?;
+    drop(connection);
     Ok(())
 }
