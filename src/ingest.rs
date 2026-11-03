@@ -71,7 +71,7 @@ impl PostgresProxy {
         // printed by Nais CLI.
         let stdout = nais_cli_process.stdout.take().ok_or(Error::Stdout)?;
         let lines = BufReader::new(stdout).lines();
-        let postgres_params = Self::read_connect_options_from_stdout(lines).await.unwrap();
+        let postgres_params = Self::read_connect_options_from_stdout(lines).await?;
 
         // Connect to the Postgres database.
         let connection = postgres_params.connect().await?;
@@ -128,6 +128,16 @@ impl PostgresProxy {
                 println!("Ignoring environment variable {key} = {value}");
             }
         };
+
+        // Override SSL verification mode.
+        // Postgres libraries support both PGHOST and PGHOSTADDR in order to manually override
+        // the IP address while still verifying the SSL hostname. sqlx does not support this.
+        // Instead, set SSL verification mode to CA only, which is probably what we want.
+        opts = opts.ssl_mode(PgSslMode::VerifyCa);
+
+        // fixme: Override Postgres database; this should probably be set by Nais CLI.
+        opts = opts.database("app");
+
         Ok(opts)
     }
 
