@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "CREATE TABLE debezium.heartbeat (timestamp TIMESTAMPTZ);",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "57a62a228dba36241f9298624c5e7c730347199c1b128505287332b5fc3609c8"
+}

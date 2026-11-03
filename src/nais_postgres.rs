@@ -1,5 +1,5 @@
-use sqlx::postgres::{PgConnectOptions, PgSslMode};
-use sqlx::{ConnectOptions, Connection, PgConnection};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::{Pool, Postgres};
 use std::process::Stdio;
 use std::str::FromStr;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use tracing::log::debug;
 /// Otherwise, both the Postgres and proxy connections will linger until the program finishes.
 pub struct PostgresProxy {
     nais_cli_process: tokio::process::Child,
-    connection: PgConnection,
+    pool: Pool<Postgres>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,15 +30,15 @@ pub enum Error {
     InvalidPort(String),
     #[error("invalid SSL mode: {0}")]
     InvalidSSLMode(String),
-    #[error("OS error: {0}")]
+    #[error("OS: {0}")]
     OS(#[from] std::io::Error),
-    #[error("Postgres error: {0}")]
+    #[error("Postgres: {0}")]
     Postgres(#[from] sqlx::Error),
 }
 
 impl PostgresProxy {
     /// How long to wait for Nais CLI to print the first line of configuration.
-    const NAIS_CLI_TIMEOUT_FIRST_OUTPUT: Duration = Duration::from_secs(5);
+    const NAIS_CLI_TIMEOUT_FIRST_OUTPUT: Duration = Duration::from_secs(10);
 
     /// How long to wait for Nais CLI to print subsequent lines of configuration.
     /// After this timeout is reached, the program considers Nais CLI ready to proxy connections.
@@ -47,6 +47,9 @@ impl PostgresProxy {
     /// Reason for Postgres privilege escalation.
     /// This reason might be used in a official court.
     const NAIS_CLI_JITA_REASON: &'static str = "Configuring database for warehouse ingestion";
+
+    /// Connection timeout to Nais Postgres.
+    const NAIS_POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Use the Nais command-line interface to set up a connection proxy to a Nais Postgres instance.
     pub async fn new(database: impl AsRef<str>) -> Result<Self, Error> {
@@ -83,18 +86,27 @@ impl PostgresProxy {
         // fixme: Override Postgres database; this should probably be set by Nais CLI.
         postgres_params = postgres_params.database("app");
 
-        let connection = postgres_params.connect().await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Self::NAIS_POSTGRES_CONNECT_TIMEOUT)
+            .connect_with(postgres_params)
+            .await?;
 
         Ok(Self {
-            connection,
+            pool,
             nais_cli_process,
         })
+    }
+
+    /// Return a reference to the Postgres connection pool.
+    pub fn pool(&self) -> &Pool<Postgres> {
+        &self.pool
     }
 
     /// Close the Postgres connection,
     /// then kill the proxy and wait until the process is dead.
     pub async fn close(mut self) -> Result<(), Error> {
-        self.connection.close().await?;
+        self.pool.close().await;
         self.nais_cli_process.start_kill()?;
         self.nais_cli_process.wait().await?;
         Ok(())

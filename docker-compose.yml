@@ -1,0 +1,10 @@
+services:
+  postgres:
+    command: postgres -c log_statement=all
+    image: postgres:18-alpine
+    ports:
+    - "5432:5432"
+    environment:
+    - "POSTGRES_USER=nada"
+    - "POSTGRES_PASSWORD=nada"
+    - "POSTGRES_DB=nada"
