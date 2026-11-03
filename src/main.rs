@@ -65,6 +65,8 @@ async fn run_subcommand(command: Commands) -> Result<(), Error> {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
     let Err(err) = run_subcommand(cli.command).await else {
         return;

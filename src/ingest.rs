@@ -7,10 +7,11 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::log::{debug, info};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
-    /// Configure Nais Postgres for ingestion.
+    /// (preview) configure Nais Postgres for ingestion.
     Enable {
         /// Name of the database to configure.
         #[arg()]
@@ -34,6 +35,18 @@ pub enum Error {
     Postgres(#[from] sqlx::Error),
 }
 
+/// Bootstrap a Nais Postgres database for use with Ingesterator.
+///
+/// FIXME: stub
+pub async fn connect_and_enable_ingest(database: impl AsRef<str>) -> Result<(), Error> {
+    info!("Opening proxy connection to Nais Postgres...");
+    let connection = PostgresProxy::new(database).await?;
+    info!("Connected to Nais Postgres!");
+    connection.close().await?;
+    info!("Connection closed successfully.");
+    Ok(())
+}
+
 /// A proxied connection to a Nais Postgres instance.
 ///
 /// The proxy is initialized by running `nais postgres proxy`.
@@ -46,20 +59,28 @@ struct PostgresProxy {
 }
 
 impl PostgresProxy {
+    /// How long to wait for Nais CLI to print the first line of configuration.
+    const NAIS_CLI_TIMEOUT_FIRST_OUTPUT: Duration = Duration::from_secs(5);
+
+    /// How long to wait for Nais CLI to print subsequent lines of configuration.
+    /// After this timeout is reached, the program considers Nais CLI ready to proxy connections.
+    const NAIS_CLI_TIMEOUT_SUBSEQUENT_OUTPUTS: Duration = Duration::from_millis(500);
+
     /// Use the Nais command-line interface to set up a connection proxy to a Nais Postgres instance.
-    ///
-    /// Note that
     pub async fn new(database: impl AsRef<str>) -> Result<Self, Error> {
         let mut command = Command::new("nais");
-        command.arg("postgres");
-        command.arg("proxy");
-        command.arg("--access-level").arg("admin");
-        command.arg("--output").arg("env");
-        command.arg("--print-password");
+
         command
+            .arg("postgres")
+            .arg("proxy")
+            .arg("--print-password")
+            .arg("--access-level")
+            .arg("admin")
+            .arg("--output")
+            .arg("env")
             .arg("--reason")
-            .arg("Configuring database for warehouse ingestion");
-        command.arg(database.as_ref());
+            .arg("Configuring database for warehouse ingestion")
+            .arg(database.as_ref());
 
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
@@ -67,13 +88,10 @@ impl PostgresProxy {
 
         let mut nais_cli_process = command.spawn()?;
 
-        // Parse Postgres connection parameters from environment variables
-        // printed by Nais CLI.
         let stdout = nais_cli_process.stdout.take().ok_or(Error::Stdout)?;
         let lines = BufReader::new(stdout).lines();
         let postgres_params = Self::read_connect_options_from_stdout(lines).await?;
 
-        // Connect to the Postgres database.
         let connection = postgres_params.connect().await?;
 
         Ok(Self {
@@ -101,13 +119,13 @@ impl PostgresProxy {
             return Ok(opts);
         };
         let Some(value) = parts.next() else {
-            println!("Parse {key}=VALUE: no value");
+            debug!("Parse {key}=VALUE: no value");
             return Ok(opts);
         };
         let value = value.trim_matches('\'');
-        println!("Captured {key}");
+        debug!("Captured environment variable {key} from Nais");
         match key {
-            "PGHOST" => opts = opts.host(value), // fixme: use for hostname ssl validation
+            "PGHOST" => {}
             "PGHOSTADDR" => opts = opts.host(value),
             "PGPORT" => {
                 let port = value
@@ -125,7 +143,7 @@ impl PostgresProxy {
             "PGPASSWORD" => opts = opts.password(value),
             "PGCONNECT_TIMEOUT" => {}
             _ => {
-                println!("Ignoring environment variable {key} = {value}");
+                debug!("Ignoring environment variable {key} = {value}");
             }
         };
 
@@ -153,13 +171,13 @@ impl PostgresProxy {
     ) -> Result<PgConnectOptions, Error> {
         let mut opts = PgConnectOptions::new();
 
-        match timeout(Duration::from_secs(5), lines.next_line()).await {
+        match timeout(Self::NAIS_CLI_TIMEOUT_FIRST_OUTPUT, lines.next_line()).await {
             Ok(Ok(Some(line))) => opts = Self::parse_stdout_env_into_connect_options(opts, line)?,
             _ => return Err(Error::Timeout),
         };
 
         loop {
-            match timeout(Duration::from_millis(500), lines.next_line()).await {
+            match timeout(Self::NAIS_CLI_TIMEOUT_SUBSEQUENT_OUTPUTS, lines.next_line()).await {
                 Ok(Ok(Some(line))) => {
                     opts = Self::parse_stdout_env_into_connect_options(opts, line)?
                 }
@@ -170,17 +188,11 @@ impl PostgresProxy {
         }
     }
 
+    /// Close the Postgres connection, then kill the proxy and wait until the process is dead.
     async fn close(mut self) -> Result<(), Error> {
         self.connection.close().await?;
         self.nais_cli_process.start_kill()?;
         self.nais_cli_process.wait().await?;
         Ok(())
     }
-}
-
-pub async fn connect_and_enable_ingest(database: impl AsRef<str>) -> Result<(), Error> {
-    let connection = PostgresProxy::new(database).await?;
-    println!("Connected to Nais Postgres");
-    connection.close().await?;
-    Ok(())
 }
