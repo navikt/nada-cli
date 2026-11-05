@@ -2,8 +2,6 @@ mod ingest;
 mod jita;
 mod kubeconfig;
 mod nais_postgres;
-#[allow(unused)]
-mod postgres_crd;
 
 use clap::{Parser, Subcommand};
 

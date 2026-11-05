@@ -1,5 +1,5 @@
-use crate::nais_postgres;
 use crate::nais_postgres::PostgresProxy;
+use crate::{nais_postgres};
 use clap::Subcommand;
 use tracing::log::{info, warn};
 
