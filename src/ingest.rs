@@ -1,4 +1,3 @@
-use crate::nais_postgres::PostgresProxy;
 use crate::{nais_postgres};
 use clap::Subcommand;
 use tracing::log::{info, warn};
@@ -16,7 +15,7 @@ pub enum Commands {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Nais Postgres proxy: {0}")]
-    Proxy(#[from] nais_postgres::Error),
+    Proxy(#[from] nais_postgres::proxy::Error),
     #[error("Postgres: {0}")]
     Postgres(#[from] sqlx::Error),
 }
@@ -47,6 +46,7 @@ pub async fn connect_and_enable_ingest(database: impl AsRef<str>) -> Result<(), 
 }
 
 use sqlx::{AssertSqlSafe, Pool, Postgres};
+use crate::nais_postgres::proxy::PostgresProxy;
 
 #[derive(Debug, Clone)]
 pub struct ReplicationConfig {
