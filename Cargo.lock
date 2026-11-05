@@ -1649,6 +1649,8 @@ dependencies = [
  "google-cloud-resourcemanager-v3",
  "google-cloud-wkt",
  "humantime",
+ "serde",
+ "serde_json",
  "sqlx",
  "tabwriter",
  "thiserror",
