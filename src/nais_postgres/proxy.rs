@@ -4,6 +4,7 @@ use sqlx::{Pool, Postgres};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
+use tracing::log::debug;
 
 /// A proxied connection to a Nais Postgres instance.
 ///
@@ -40,8 +41,53 @@ impl PostgresProxy {
     /// This reason might be used in a official court.
     const NAIS_CLI_JITA_REASON: &'static str = "Configuring database for warehouse ingestion";
 
-    /// Use the Nais command-line interface to set up a connection proxy to a Nais Postgres instance.
+    /// Set up a new proxied connection to a Nais Postgres database,
+    /// triggering login flow to both nais and gcloud if needed.
     pub async fn new(database: impl AsRef<str>) -> Result<Self, Error> {
+        Self::login()?;
+        Self::start(database).await
+    }
+
+    /// Return a reference to the Postgres connection pool.
+    pub fn pool(&self) -> &Pool<Postgres> {
+        &self.pool
+    }
+
+    /// Close the Postgres connection,
+    /// then kill the proxy and wait until the process is dead.
+    pub async fn close(mut self) -> Result<(), Error> {
+        self.pool.close().await;
+        self.nais_cli_process.wait()?;
+        Ok(())
+    }
+
+    /// Login to gcloud and Nais using Nais CLI.
+    fn login() -> Result<(), Error> {
+        debug!("Login to Nais...");
+
+        let mut command = Command::new("nais");
+
+        command
+            .arg("auth")
+            .arg("login")
+            .arg("--nais")
+            .arg("--yes");
+
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+
+        command.status()?;
+
+        debug!("Login successful!");
+
+        Ok(())
+    }
+
+    /// Use the Nais command-line interface to set up a connection proxy to a Nais Postgres instance.
+    async fn start(database: impl AsRef<str>) -> Result<Self, Error> {
+        debug!("Start Nais Postgres proxy...");
+
         let mut command = Command::new("nais");
 
         command
@@ -63,10 +109,13 @@ impl PostgresProxy {
 
         let mut nais_cli_process = command.spawn()?;
 
+        debug!("Nais Postgres proxy process started, waiting for parameters...");
+
         let stdout = nais_cli_process.stdout.take().ok_or(Error::Stdout)?;
-        // let lines = BufReader::new(stdout).lines();
         let output: NaisPostgresProxyOutput = serde_json::from_reader(stdout)?;
         let postgres_params: PostgresParams = output.try_into()?;
+
+        debug!("Parameters validated, waiting for Postgres connection...");
 
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -74,23 +123,12 @@ impl PostgresProxy {
             .connect_with(postgres_params.options)
             .await?;
 
+        debug!("Connection successful!");
+
         Ok(Self {
             pool,
             nais_cli_process,
         })
-    }
-
-    /// Return a reference to the Postgres connection pool.
-    pub fn pool(&self) -> &Pool<Postgres> {
-        &self.pool
-    }
-
-    /// Close the Postgres connection,
-    /// then kill the proxy and wait until the process is dead.
-    pub async fn close(mut self) -> Result<(), Error> {
-        self.pool.close().await;
-        self.nais_cli_process.wait()?;
-        Ok(())
     }
 }
 
